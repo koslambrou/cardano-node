@@ -19,11 +19,13 @@ module Cardano.CLI.Shelley.Run.Query
   , runQueryCmd
   , percentage
   , executeQuery
+  , queryQueryTip
   ) where
 
 import           Cardano.Api
 import           Cardano.Api.Byron
 import           Cardano.Api.Shelley
+
 import           Cardano.Binary (decodeFull)
 import           Cardano.CLI.Environment (EnvSocketError, readEnvSocketPath, renderEnvSocketError)
 import           Cardano.CLI.Helpers (HelpersError (..), hushM, pPrintCBOR, renderHelpersError)
@@ -35,6 +37,7 @@ import           Cardano.Ledger.Coin
 import           Cardano.Ledger.Crypto (StandardCrypto)
 import           Cardano.Ledger.Keys (KeyHash (..), KeyRole (..))
 import           Cardano.Prelude hiding (atomically)
+import           Cardano.Slotting.EpochInfo (hoistEpochInfo)
 import           Control.Concurrent.STM
 import           Control.Monad.Trans.Except (except)
 import           Control.Monad.Trans.Except.Extra (firstExceptT, handleIOExceptT, hoistMaybe, left)
@@ -46,6 +49,7 @@ import           Numeric (showEFloat)
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Types (RelativeTime (..),
                    SystemStart (..), toRelativeTime)
 import           Ouroboros.Consensus.Cardano.Block as Consensus (EraMismatch (..))
+import qualified Ouroboros.Consensus.HardFork.History as Consensus
 import           Ouroboros.Network.Block (Serialised (..))
 import           Ouroboros.Network.Protocol.LocalStateQuery.Type (AcquireFailure (..))
 import           Prelude (String, id)
@@ -235,12 +239,19 @@ runQueryTip (AnyConsensusModeParams cModeParams) network mOutFile = do
 
             mSyncProgress <- hushM syncProgressResult $ \e -> do
               liftIO . T.hPutStrLn IO.stderr $ "Warning: Sync progress unavailable: " <> renderShelleyQueryCmdError e
-
-            return $ Just $ O.QueryTipLocalStateOutput
-              { O.mEra = Just (O.era localState)
-              , O.mEpoch = Just epochNo
-              , O.mSyncProgress = mSyncProgress
-              }
+            case mLocalState of
+              Nothing -> return $ Just $ O.QueryTipLocalStateOutput
+                           { O.mEra = Just (O.era localState)
+                           , O.mEpoch = Just epochNo
+                           , O.mSyncProgress = mSyncProgress
+                           , O.mSystemStartOut = Nothing
+                           }
+              Just mLState -> return $ Just $ O.QueryTipLocalStateOutput
+                                { O.mEra = Just (O.era localState)
+                                , O.mEpoch = Just epochNo
+                                , O.mSyncProgress = mSyncProgress
+                                , O.mSystemStartOut = O.mSystemStart mLState
+                                }
 
       let jsonOutput = encodePretty $ O.QueryTipOutput
             { O.chainTip = chainTip
@@ -272,7 +283,7 @@ queryQueryTip connectInfo mpoint = do
       { localChainSyncClient    = LocalChainSyncClient $ chainSyncGetCurrentTip waitResult resultVarChainTip
       , localStateQueryClient   = Just $ setupLocalStateQueryScript waitResult mpoint ntcVersion resultVarQueryTipLocalState $ do
           era <- sendMsgQuery (QueryCurrentEra CardanoModeIsMultiEra)
-          eraHistory <- sendMsgQuery (QueryEraHistory CardanoModeIsMultiEra)
+          eraHistory@(EraHistory _ interpreter) <- sendMsgQuery (QueryEraHistory CardanoModeIsMultiEra)
           mSystemStart <- if ntcVersion >= NodeToClientV_9
             then Just <$> sendMsgQuery QuerySystemStart
             else return Nothing
@@ -280,6 +291,8 @@ queryQueryTip connectInfo mpoint = do
             { O.era = era
             , O.eraHistory = eraHistory
             , O.mSystemStart = mSystemStart
+            , O.epochInfo = hoistEpochInfo (first TransactionValidityIntervalError . runExcept)
+                              $ Consensus.interpreterToEpochInfo interpreter
             }
 
       , localTxSubmissionClient = Nothing
